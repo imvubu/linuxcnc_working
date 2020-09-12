@@ -1,0 +1,249 @@
+/*************************************************************************************************************************************
+
+EMC2 HAL component to implement ATC toolchanging in Denford ORAC CNC lathes
+
+(c) ArcEye 01122011 schooner30@tiscali.co.uk
+
+All values are metric
+
+Version 6a -   The Orac toolchanger has a 3 line optical disc divided into 8 sectors which determines position by use of a truth table
+               Unfortunately 2 factors can complicate this seemingly straightforward arrangement.
+               
+               1) The disc itself can be moved, completely throwing out any assumptions about which tool is the current one.
+               This means that the truth table used here may not match your ATC, especially if it has been dismantled at any time
+               You need to manually check what opto switches are true/false for each tool position.
+               Running the module as is, will quickly show a consistant over or under run of tool numbers which can be adjusted if your 
+               optical disc position differs from this one.
+               
+               2) The ATC is quite slow and this module is very fast, which results in the optical switches reading the required sector, 
+               long before it reaches the latch for that sector.  This results in the ATC reversing to the previous sectors latch and
+               producing the tool number prior to that requested.
+               The later situation is simply resolved internally by the module adding 1 to the requested tool number
+               
+               To cater for the delay in mechanical relays switching the motor on and off and forward and reverse, and to allow the motor
+               itself to cease movement, there is a simple counter delay in the component.
+               The period of this delay is set by default to 500, which equates to 1-2 secs on my test system
+               It can be modified in the .hal file using
+               'setp oracchanger.times nnn' where nnn is the new value
+               
+               To allow the ATC time to reverse back against the tool station latch before the motor is switched off, a timedelay component
+               is used with the on-delay set to 5 seconds.
+               This is activated automatically by the oracchanger component with the hal connections shown below.
+               
+               This component has been extensively tested by 'cncbasher' from the EMC forums on his Denford Orac lathe
+               and works 'as is' with the above caveats regards optical disc alignment.
+               
+               Compile the components with 'sudo comp --install oracchanger.comp'
+               and                         'sudo comp --install timedelay2.comp' respectively
+               
+               Below .hal file extracts give a specimen .hal connection guide.
+               
+               
+###############################################################
+# loading the toolchange and timedelay2 components in .hal file
+###############################################################
+
+loadrt oracchanger
+addf oracchanger servo-thread
+
+loadrt timedelay count=1
+addf timedelay.0 servo-thread
+# will wait 5 secs approx and turn motor off after reversing against stop
+setp timedelay.0.on-delay 5   
+
+net tool-change iocontrol.0.tool-change => oracchanger.toolchange
+net tool-changed iocontrol.0.tool-changed <= oracchanger.toolchanged
+net tool-number iocontrol.0.tool-prep-number => oracchanger.toolnumber
+net tool-oldnumber iocontrol.0.tool-number => oracchanger.currenttoolnumber
+net tool-prepare-loopback iocontrol.0.tool-prepare => iocontrol.0.tool-prepared
+
+net sig1 oracchanger.opto1 <= parport.x.pin-xx-in
+net sig2 oracchanger.opto2 <= parport.x.pin-xx-in
+net sig3 oracchanger.opto3 <= parport.x.pin-xx-in
+
+net sig-forward oracchanger.forward => parport.x.pin-xx-out
+net sig-run oracchanger.run => parport.x.pin-xx-out
+
+net xhomed axis.0.homed => oracchanger.ishomedX
+net zhomed axis.2.homed => oracchanger.ishomedZ
+
+net delaystart timedelay.0.in <= oracchanger.delaystart
+net delaydone timedelay.0.out => oracchanger.delaydone
+
+# if the delay is too long in switching relays for forward and reverse
+# setp oracchanger.times 300
+# for instance will make it shorter, default is 500 - about 1-2 secs on my system
+
+################################################################################
+
+***************************************************************************************************************************************/
+
+
+component oracchanger                   "This component controls the Orac Lathe Auto Tool Changer. M6 calls this";
+
+pin in bit toolchange                   "Receives signal from M6 that tool change required";
+pin in s32 toolnumber                   "Receives Tx data from M6 (tool number requested) Only allows 1-8";
+pin in s32 currenttoolnumber            "Receives old tool number";
+pin out bit toolchanged = false         "Sends signal when tool change finished";
+
+pin out bit delaystart = false          "Starts timerdelay";
+pin in bit delaydone =false             "Signals timer finished";
+
+pin in bit opto1 = false                "State of opto sensor 1";
+pin in bit opto2 = false                "State of opto sensor 2";
+pin in bit opto3 = false                "State of opto sensor 3";
+
+pin out bit forward = false             "Direction signal";
+pin out bit run = false                 "Motor command";
+
+pin in bit ishomedX = false             "Status of X axis homing";
+pin in bit ishomedZ = false             "Status of Z axis homing";
+
+pin out s32 position = 0                "Initialised as a pin for debugging so we can check where it thinks it is";
+
+param rw float times = 500              "Number of polls of progress_levels 1 & 3 before beginning next move - gives delay for relays";
+
+// Internal and debugging stuff
+pin out s32 progress_level = 0;         // tracks the progress of the toolchange, just here so it can be read easily
+param rw s32 tnumber = 0;               // Internal toolnumber to allow overrun of quadrant by 1 then reverse back onto it
+
+variable bool bWarn = false;            // first toolnumber reminder
+
+variable float sleeptime = 0;           // our own timer to set delay between progress levels 1 and 2
+
+option singleton yes;                   // makes no sense to have more than one of these components running - only one ATC
+function _;
+author "ArcEye schooner30@tiscali.co.uk";
+license "GPL";
+;;
+
+
+FUNCTION(_)
+{
+    switch (progress_level)
+        {
+        case 0:  // idle waiting for toolchange request
+                 // axis does not remember the current tool number, so prompt for it once homed    
+                if((!currenttoolnumber && !bWarn)&&(ishomedX)&&(ishomedZ))
+                    {
+                    bWarn = true;  // just warn once, its not an error as such but INFO won't display unless debugging is set 3+
+                    rtapi_print_msg(RTAPI_MSG_ERR, "No tool selected. Use M6Tx to set current tool");
+                    break;  
+                    }
+                if(toolchange && !toolchanged)  // prevent cycling after change done 
+                    {
+                    if(currenttoolnumber && toolnumber != currenttoolnumber && toolnumber > 0 && toolnumber < 9) // if a valid number
+                        {
+                        run = false; // switch off motor if already on
+                        tnumber = toolnumber + 1;   
+                        if(tnumber > 8)             // add 1 so that stops on sector after required & reverses back to it
+                            tnumber = tnumber - 8;  
+
+                        delaystart = false;         //new toolchange - reset comp
+                        forward = true;
+                        sleeptime = 0;
+                        progress_level = 1;
+                        break;
+                        }
+                    else    // if tool requested is out of range set the toolchanged flag and exit
+                            // should only get this if tool table has more tools than ATC can have
+                            // otherwise emc will error the M6 command
+                        {
+                        progress_level = 5;
+                        run = false;                // switch off motor if already on
+                        }
+                    }
+                 if(!toolchange && toolchanged)
+                     toolchanged = false;           // reset once toolchange flag reset by system
+                     
+                 if(toolchange && !currenttoolnumber) // if no tool is set in axis - set axis to tool requested so that can work next time
+                     {                                
+                     forward = false;
+                     run = false;
+                     progress_level = 5;
+                     }
+                 if(delaydone)                      // turn off motor after a delay to lock
+                    {
+                    run=false;
+                    delaystart=false;
+                    }
+                 break;
+                 
+         
+        case 1: // programmed delay to allow relays time to change over
+                 if(sleeptime < times)  
+                    {
+                    sleeptime++;
+                    break;
+                    }
+                run = true;
+                progress_level = 2;
+                break;
+                      
+        case 2: // Forward move - read the truth table to determine position
+                if(opto1 && opto2 && opto3) 
+                    position = 1;
+                else if(opto1 && opto2 && !opto3) 
+                    position =  2;
+                else if(!opto1 && opto2 && !opto3) 
+                    position =  3;
+                else if(!opto1 && !opto2 && !opto3) 
+                    position =  4;
+                else if(opto1 && !opto2 && !opto3) 
+                    position =  5;
+                else if(opto1 && !opto2 && opto3) 
+                    position =  6;
+                else if(!opto1 && !opto2 && opto3) 
+                    position =  7;
+                else if(!opto1 && opto2 && opto3) 
+                    position =  8;
+                else
+                    position = 0;
+
+                if(!position)  // if returning 0 something is wrong
+                    {
+                    rtapi_print_msg(RTAPI_MSG_ERR, "Error - opto inputs do not match truth table");
+                    progress_level = 12; // doesn't exist so will go to default, output msg and then sit in level 10
+                    break;
+                    }
+                    
+                if(position != tnumber)  // wait for next tool + 1 to come around
+                    break;
+                    
+                run = false;
+                forward = false;
+                sleeptime = 0;
+                delaystart = true;
+                progress_level = 3;
+                break;
+                
+        case 3: // programmed delay to allow relays time to change over
+                if(sleeptime < times)  
+                    {
+                    sleeptime++;
+                    break;
+                    }
+                run = true;         // Backward locking move
+                delaystart = true;
+                progress_level = 5; // after first toolchange or update of tool number this is default, reverse with 12v applied to lock
+                break; 
+                
+        case 5: // clean up ready for next toolchange
+                delaystart = true;     // start the 5 second delay relay component to give time to latch
+                progress_level = 0;
+                toolchanged = true;   // signal finished
+                break;
+                
+        case 10:   break;  // should never get here but if we do then loop endlessly doing nothing
+                
+        default:    
+                progress_level = 10;
+                rtapi_print_msg(RTAPI_MSG_ERR, "Error state in oracchanger - now disabled - unload oracchanger");            
+                break;
+        }
+ 
+}
+
+
+
+

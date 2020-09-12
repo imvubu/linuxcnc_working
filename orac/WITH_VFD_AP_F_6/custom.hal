@@ -1,0 +1,63 @@
+# Include your customized HAL commands here
+# This file will not be overwritten when you run stepconf again
+
+loadusr -Wn vfd hy_vfd -n vfd -t 1 -d /dev/ttyUSB0 -p none -r 38400 -s 1
+
+net spindle-cmd-rpm-abs 		=> vfd.speed-command
+net spindle-cw motion.spindle-forward 	=> vfd.spindle-forward 
+net spindle-ccw motion.spindle-reverse 	=> vfd.spindle-reverse
+net spindle-on motion.spindle-on => vfd.spindle-on
+net spindle-at-speed => vfd.spindle-at-speed
+net xenable vfd.enable
+
+unlinkp iocontrol.0.tool-changed
+unlinkp iocontrol.0.tool-change
+
+loadrt carousel pockets=8 encoding=edge dir=1
+loadrt not
+loadrt encoder names=spindle
+loadrt pwmgen output_type=0
+loadrt debounce cfg=1,2
+loadrt scale
+addf carousel.0	servo-thread
+addf pwmgen.update servo-thread
+addf pwmgen.make-pulses base-thread
+addf not.0 base-thread
+addf encoder.update-counters base-thread
+addf encoder.capture-position servo-thread
+addf debounce.0   base-thread
+addf debounce.1   base-thread
+addf scale.0 servo-thread
+
+net index        parport.0.pin-12-in          debounce.1.0.in
+net index-filt   debounce.1.0.out             carousel.0.sense-0
+net position     parport.0.pin-11-in          debounce.1.1.in
+net pos-filt     debounce.1.1.out             carousel.0.sense-1
+net tool-number  iocontrol.0.tool-prep-number carousel.0.pocket-number
+net start-change iocontrol.0.tool-change      carousel.0.enable
+net tool-ready   iocontrol.0.tool-changed     carousel.0.ready
+net tool-pwm     carousel.0.motor-vel         pwmgen.0.value
+setp carousel.0.hold-dc 0.55
+setp carousel.0.fwd-dc  0.00
+setp carousel.0.rev-dc  1.00
+setp carousel.0.rev-pulse 3.0
+net pwm     pwmgen.0.pwm         parport.0.pin-06-out not.0.in
+net pwm-not not.0.out            parport.0.pin-07-out
+net xenable parport.0.pin-08-out parport.0.pin-09-out
+net xenable pwmgen.0.enable      parport.0.pin-17-out
+
+net phase-A parport.0.pin-13-in  spindle.phase-A
+net phase-Z parport.0.pin-15-in  spindle.phase-Z
+setp spindle.counter-mode 1
+setp spindle.position-scale 48
+net spindle-pos spindle.position motion.spindle-revs
+net spindle-vel spindle.velocity motion.spindle-speed-in 
+net spindle-vel => scale.0.in
+net spindle.index motion.spindle-index-enable spindle.index-enable
+setp scale.0.gain 60
+
+net all-limit-raw parport.0.pin-10-in debounce.0.0.in
+net all-home debounce.0.0.out axis.0.home-sw-in axis.2.home-sw-in
+#net all-limit debounce.1.0.out axis.0.pos-lim-sw-in axis.2.neg-lim-sw-in
+setp debounce.0.delay 100
+setp debounce.1.delay 250
